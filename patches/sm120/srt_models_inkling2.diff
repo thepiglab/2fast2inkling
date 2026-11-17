@@ -1,0 +1,33 @@
+--- a/sglang/srt/models/inkling2.py
++++ b/sglang/srt/models/inkling2.py
+@@ -50,7 +50,13 @@
+ 
+ VERIFY_ROUTED_EPILOGUE_MAX_TOKENS = 32
+ 
++import os
+ 
++# inkling-rt knob: INKRT_LMHEAD=replicated keeps the full LM head on every rank, so no FP32 logits all-gather
++# (on PCIe nodes the vocab-parallel gather of 201k FP32 logits per token cost ~6 ms per decode step at bs 228).
++_LMHEAD_REPLICATED = os.environ.get("INKRT_LMHEAD", "") == "replicated"
++
++
+ class Inkling2DecoderLayer(nn.Module):
+     def __init__(self, config, layer_id, quant_config, prefix):
+         super().__init__()
+@@ -148,7 +154,7 @@
+ 
+ class Inkling2LogitsProcessor(LogitsProcessor):
+     def __init__(self, config, output_dtype=torch.bfloat16):
+-        super().__init__(config)
++        super().__init__(config, skip_all_gather=_LMHEAD_REPLICATED)
+         self.vocab_size = config.padded_vocab_size
+         self.input_logprob_processor.vocab_size = self.vocab_size
+         self.use_fp32_lm_head = output_dtype == torch.float32
+@@ -234,6 +240,7 @@
+             config.padded_vocab_size,
+             config.hidden_size,
+             prefix=add_prefix("lm_head", prefix),
++            enable_tp=not _LMHEAD_REPLICATED,
+         )
+         self.logits_processor = Inkling2LogitsProcessor(
+             config,

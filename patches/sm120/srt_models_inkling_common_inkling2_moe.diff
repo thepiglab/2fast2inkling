@@ -1,0 +1,67 @@
+--- a/sglang/srt/models/inkling_common/inkling2_moe.py
++++ b/sglang/srt/models/inkling_common/inkling2_moe.py
+@@ -83,6 +83,23 @@
+ BF16_COMBINE_MIN_TOKENS = 512
+ 
+ 
++import os
++
++# inkling-rt knob: expert-combine all-reduce dtype on SM12x (fp32 = exact partial sums, bf16 = half the bytes).
++_MOE_AR_BF16 = os.environ.get("INKRT_MOE_AR", "fp32") == "bf16"
++_AR_TP = os.environ.get("INKRT_AR_GROUP", "") == "tp"
++
++
++_SM12X_ROUTE_MAX_IDS = 2688  # 336 tokens x top-8; 36 * 2688 + 1.6 KB < 99 KB
++
++
++def _sm12x() -> bool:
++    """inkling-rt sm_120 enablement: RTX Blackwell (SM12x) takes the Hopper (Marlin,
++    fake-quantized NVFP4/MXFP8) expert path; PCIe nodes have no NVLink multicast."""
++    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12
++
++
++
+ class RoutedOutput(NamedTuple):
+     """Expert rows in routing order, all-reduced; combined by the consumer.
+     top_k 0: rows are already combined per token (src2dst None)."""
+@@ -232,7 +249,7 @@
+                         },
+                     )
+         self.gate_cap, self.up_cap = config.mlp_gate_softcap, config.mlp_up_softcap
+-        self.sm90 = get_platform().is_sm90
++        self.sm90 = get_platform().is_sm90 or _sm12x()
+         self.output_sizes = {"w13": 2 * intermediate, "w2": config.hidden_size}
+         self._marlin = {}
+         self.max_routed_ids = min(
+@@ -652,7 +669,9 @@
+         start = self.ep_rank * num_local
+         flat = ids.flatten()
+         n = flat.numel()
+-        if n <= ROUTE_MAX_IDS:
++        # inkling-rt: route_metadata's one-CTA sort needs ~36 B/id of shared memory; SM12x allows 99 KB per
++        # block (B200/H100: 227 KB), so above ~2.7k ids use the sort fallback there.
++        if n <= (_SM12X_ROUTE_MAX_IDS if _sm12x() else ROUTE_MAX_IDS):
+             _, dst2src, _, counts, offsets, *_ = route_metadata(
+                 flat, weights.flatten(), start, num_local, self.num_global_experts
+             )
+@@ -698,6 +717,20 @@
+             scales = (None, None, None)
+         down = matmul(hidden, self._marlin["w2"], self.output_sizes["w2"], top_k=1)
+         group = get_parallel().moe_ep_group
++        if _sm12x():
++            # No NVLink multicast: FP32 partial sums, reduced over NCCL / custom AR.
++            sums = marlin_sm90.source_partial(down, flat, scales, start, num_local, top_k)
++            if _MOE_AR_BF16:
++                # Halves the PCIe bytes; each rank's FP32 partial is rounded once to BF16.
++                sums = sums.to(torch.bfloat16)
++            parallel = get_parallel()
++            ar_group = group
++            if _AR_TP and parallel.tp_size == parallel.moe_ep_size:
++                ar_group = parallel.tp_group  # same ranks; eligible for SGLang's PCIe-IPC all-reduce
++            combined = ar_group.all_reduce(sums)
++            if not combine:
++                return RoutedOutput(combined, self._identity[:tokens], 1)
++            return combined.to(x.dtype)
+         out = (
+             oneshot_all_reduce_input(
+                 group, tokens, down.shape[1], torch.bfloat16, tag="moe"

@@ -1,0 +1,12 @@
+--- a/sglang/srt/models/inkling2_vision.py
++++ b/sglang/srt/models/inkling2_vision.py
+@@ -79,7 +79,8 @@
+             for projection in (self.q_proj, self.k_proj, self.v_proj)
+         )
+         q, k = _rotary(q, k, positions)
+-        if hidden.is_cuda:
++        # pigmed patch: sm_12x (RTX PRO 6000) has no FA cute vision kernel; use the per-image SDPA path below
++        if hidden.is_cuda and torch.cuda.get_device_capability(hidden.device)[0] in (9, 10):
+             from sglang.kernels.ops.attention.flash_attn.cute import (
+                 flash_attn_varlen_func,
+             )

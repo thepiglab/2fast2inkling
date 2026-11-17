@@ -1,0 +1,109 @@
+--- a/sglang/srt/layers/attention/flashattention_backend.py
++++ b/sglang/srt/layers/attention/flashattention_backend.py
+@@ -365,6 +365,9 @@
+                 self._get_fa_runtime_policy = (
+                     get_flash_attention_v4_sm120_runtime_policy
+                 )
++                # inkling-rt: the SM120 FA4 kernel requires out dtype == q dtype; Inkling asks for FP32 out.
++                flash_attn_varlen_func = _inkrt_same_dtype_out(flash_attn_varlen_func)
++                flash_attn_with_kvcache = _inkrt_same_dtype_out(flash_attn_with_kvcache)
+             else:
+                 from sglang.kernels.ops.attention.flash_attention_v4 import (
+                     flash_attn_varlen_func,
+@@ -1878,7 +1881,7 @@
+             elif rel_bias_compact_decode:
+                 assert forward_batch.forward_mode.is_target_verify()
+                 assert not (use_local_attn or use_cascade_attn or return_lse)
+-                from sglang.kernels.ops.inkling2.attention import rel_bias_partials
++                rel_bias_partials = _inkrt_rel_bias_partials
+ 
+                 result = rel_bias_decode_epilogue(
+                     *rel_bias_partials(
+@@ -2410,7 +2413,7 @@
+                     kwargs["max_seqlen_k"] = metadata.max_seq_len_k
+                 if rel_bias_compact_decode:
+                     assert not (use_cascade_attn or pa_swa_active or return_lse)
+-                    from sglang.kernels.ops.inkling2.attention import rel_bias_partials
++                    rel_bias_partials = _inkrt_rel_bias_partials
+ 
+                     result = rel_bias_decode_epilogue(
+                         *rel_bias_partials(
+@@ -3771,3 +3774,78 @@
+ @torch._dynamo.disable()
+ def merge_state_v2_wrapper(o, s_a, o_exp, s_b):
+     return merge_state_v2(o, s_a, o_exp, s_b)
++
++
++# inkling-rt sm_120 enablement: Inkling's compact rel-bias decode/verify partials on SM12x run
++# through the Hopper Triton split-KV kernel, never the SM100 CuTe or FA4 SM90 (wgmma) kernels.
++
++
++
++def _inkrt_sm12x():
++    return torch.cuda.get_device_capability()[0] == 12
++
++
++def _inkrt_rel_bias_partials(
++    q,
++    k_cache,
++    v_cache,
++    page_table,
++    seqused_k,
++    rel_bias,
++    softmax_scale,
++    out,
++    *,
++    window_size_left,
++    verify,
++):
++    if _inkrt_sm12x():
++        from sglang.kernels.ops.inkling2.decode_attention_sm90 import decode_partials
++
++        return decode_partials(
++            q,
++            k_cache,
++            v_cache,
++            page_table,
++            seqused_k,
++            rel_bias,
++            softmax_scale,
++            window_size_left=window_size_left,
++        )
++    from sglang.kernels.ops.inkling2.attention import rel_bias_partials as _rel_bias_partials
++
++    return _rel_bias_partials(
++        q,
++        k_cache,
++        v_cache,
++        page_table,
++        seqused_k,
++        rel_bias,
++        softmax_scale,
++        out,
++        window_size_left=window_size_left,
++        verify=verify,
++    )
++
++
++def _inkrt_same_dtype_out(fn):
++    """SM120 FA4 accepts only out.dtype == q.dtype: run with a q-dtype output and upcast into the
++    caller's buffer (one BF16 rounding of the attention output that SM100 keeps in FP32)."""
++
++    def wrapped(*args, out=None, **kwargs):
++        q = kwargs["q"] if "q" in kwargs else args[0]
++        if out is None or out.dtype == q.dtype:
++            return fn(*args, out=out, **kwargs)
++        tmp = torch.empty(out.shape, dtype=q.dtype, device=out.device)
++        result = fn(*args, out=tmp, **kwargs)
++        out.copy_(tmp)
++
++        def swap(t):
++            if isinstance(t, torch.Tensor) and t.data_ptr() == tmp.data_ptr():
++                return out.view(t.shape)
++            return t
++
++        if isinstance(result, tuple):
++            return (swap(result[0]), *result[1:])
++        return swap(result)
++
++    return wrapped

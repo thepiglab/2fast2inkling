@@ -1,0 +1,81 @@
+--- a/sglang/srt/models/inkling_common/inkling2_attn.py
++++ b/sglang/srt/models/inkling_common/inkling2_attn.py
+@@ -35,6 +35,19 @@
+ from sglang.srt.runtime_context import get_model, get_parallel, get_platform
+ from sglang.srt.utils import add_prefix, get_device_core_count, set_weight_attrs
+ 
++
++import os
++
++_AR_TP = os.environ.get("INKRT_AR_GROUP", "") == "tp"
++
++
++def _sm90_like() -> bool:
++    """inkling-rt sm_120 enablement: SM12x takes the Hopper attention paths."""
++    return get_platform().is_sm90 or (
++        torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12
++    )
++
++
+ PADDED_DECODE_MIN_TOKENS = 8
+ # linear() sums split-K partials up to this many rows (its tiles < 256 branch).
+ PAIRED_PARTIALS_MAX_TOKENS = 2048
+@@ -253,14 +266,14 @@
+                 sliding_window_size=config.sliding_window_size - 1 if is_local else -1,
+                 prefix=add_prefix("attn_padded", prefix),
+                 out_dtype=torch.float32,
+-                num_splits=0 if get_platform().is_sm90 else 1,
++                num_splits=0 if _sm90_like() else 1,
+                 pack_gqa=True,
+                 strided_lse=True,
+             )
+             if group > 1 and 128 % group
+             else None
+         )
+-        self.verify_wave_splits = not get_platform().is_sm90
++        self.verify_wave_splits = not _sm90_like()
+         self.verify_max_splits = (
+             -(-config.sliding_window_size // 128) + 1 if is_local else 128
+         )
+@@ -429,7 +442,7 @@
+                 mode.is_decode()
+                 or verify
+                 and (
+-                    get_platform().is_sm90
++                    _sm90_like()
+                     or envs.SGLANG_OPT_INKLING2_VERIFY_REL_BIAS_KERNEL.get()
+                     and tokens <= VERIFY_REL_BIAS_MAX_TOKENS
+                 )
+@@ -438,7 +451,7 @@
+         padded = (
+             self.attn_padded is not None
+             and not compact
+-            and (get_platform().is_sm90 or tokens >= PADDED_DECODE_MIN_TOKENS)
++            and (_sm90_like() or tokens >= PADDED_DECODE_MIN_TOKENS)
+             and (mode.is_decode() or verify)
+         )
+         presheared = False
+@@ -451,7 +464,7 @@
+             # The MXFP8 score modifier consumes the unsheared relative-bias row.
+             presheared = (
+                 not mxfp8
+-                and not get_platform().is_sm90
++                and not _sm90_like()
+                 and fa_meta.swa_spec_metadata is None
+                 and fa_meta.max_seq_len_q * self.padded_group <= 128
+             )
+@@ -555,6 +568,14 @@
+             )
+         parallel = get_parallel()
+         multicast = parallel.moe_ep_size > 1
++        if torch.cuda.get_device_capability()[0] == 12:
++            # PCIe node (no NVLink multicast): plain group all-reduce. INKRT_AR_GROUP=tp sends it through the
++            # "tp" group (same ranks when attn_tp == tp), the only group SGLang's PCIe-IPC all-reduce serves.
++            output, _ = self.wo_ud(output)
++            group = parallel.attn_tp_group
++            if _AR_TP and parallel.tp_size == parallel.attn_tp_size:
++                group = parallel.tp_group
++            return group.all_reduce(output)
+         if (
+             multicast
+             and (mode.is_decode() or verify)

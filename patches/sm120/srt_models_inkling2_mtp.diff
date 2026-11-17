@@ -1,0 +1,11 @@
+--- a/sglang/srt/models/inkling2_mtp.py
++++ b/sglang/srt/models/inkling2_mtp.py
+@@ -144,7 +144,7 @@
+             attn.attn.window_anchor_at_start = layer_id in config.local_layer_ids
+             attn.attn.num_splits = (
+                 0
+-                if get_platform().is_sm90 or layer_id not in config.local_layer_ids
++                if get_platform().is_sm90 or torch.cuda.get_device_capability()[0] == 12 or layer_id not in config.local_layer_ids
+                 else 1
+             )
+             attn.attn.pack_gqa = True
